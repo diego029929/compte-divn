@@ -1,7 +1,7 @@
 {
   "name": "compte-divn",
   "version": "1.0.0",
-  "description": "Backend pour la gestion des comptes DIVN",
+  "description": "Backend pour la gestion des comptes DIVN avec Express et SQLite",
   "main": "server.js",
   "type": "module",
   "scripts": {
