@@ -17,11 +17,11 @@ const REFRESH_TOKEN_EXPIRES_DAYS = parseInt(process.env.REFRESH_TOKEN_EXPIRES_DA
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || "12", 10);
 const DB_FILE = process.env.DB_FILE || "./data/auth.sqlite";
 
+// Crée dossier data si pas là
 if (!fs.existsSync("./data")) fs.mkdirSync("./data", { recursive: true });
 
+// Base SQLite
 const db = new Database(DB_FILE);
-
-// Init tables if not exists
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -43,82 +43,79 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 `);
 
 const app = express();
-app.use(cors({ origin: true })); // en dev, autorise localhost front. En prod, configurer strictement
+app.use(cors({ origin: true })); // en dev, accepte tout. En prod, configure ton domaine.
 app.use(express.json());
 
 // Helpers
-function nowTs() { return Math.floor(Date.now() / 1000); }
-function daysToSeconds(d) { return d * 24 * 60 * 60; }
+const nowTs = () => Math.floor(Date.now() / 1000);
+const daysToSeconds = (d) => d * 24 * 60 * 60;
 
-// Générer access token (JWT)
 function generateAccessToken(user) {
-  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRES });
+  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, {
+    expiresIn: ACCESS_TOKEN_EXPIRES,
+  });
 }
 
-// Vérifier token middleware
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith("Bearer ")) return res.status(401).json({ error: "Non authentifié" });
-  const token = auth.slice(7);
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Non authentifié" });
+  }
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
     req.user = payload;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: "Token invalide ou expiré" });
   }
 }
 
-// Endpoints
+// ========================
+// ROUTES
+// ========================
 
 // Register
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
 
-  const userExists = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-  if (userExists) return res.status(400).json({ error: "Email déjà utilisé" });
+  const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+  if (exists) return res.status(400).json({ error: "Email déjà utilisé" });
 
   const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  const id = uuidv4();
-  const created_at = nowTs();
+  db.prepare("INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)").run(
+    uuidv4(),
+    username || null,
+    email,
+    hash,
+    nowTs()
+  );
 
-  const stmt = db.prepare("INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)");
-  stmt.run(id, username || null, email, hash, created_at);
-
-  return res.json({ message: "Compte créé avec succès" });
+  res.json({ message: "Compte créé avec succès" });
 });
 
 // Login
 app.post("/login", async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
+  if (!email || !password) return res.status(400).json({ error: "Champs manquants" });
 
-  const user = db.prepare("SELECT id, username, email, password_hash, created_at FROM users WHERE email = ?").get(email);
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
   if (!user) return res.status(400).json({ error: "Utilisateur introuvable" });
 
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: "Mot de passe incorrect" });
 
-  // Générer tokens
   const accessToken = generateAccessToken(user);
-  const refreshTokenPlain = randomBytes(64).toString("hex");
-  const refreshTokenHash = await bcrypt.hash(refreshTokenPlain, BCRYPT_ROUNDS);
-  const refreshId = uuidv4();
-  const expires_at = nowTs() + daysToSeconds(REFRESH_TOKEN_EXPIRES_DAYS);
+  const refreshPlain = randomBytes(64).toString("hex");
+  const refreshHash = await bcrypt.hash(refreshPlain, BCRYPT_ROUNDS);
 
   db.prepare("INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(refreshId, user.id, refreshTokenHash, expires_at, nowTs());
+    .run(uuidv4(), user.id, refreshHash, nowTs() + daysToSeconds(REFRESH_TOKEN_EXPIRES_DAYS), nowTs());
 
-  // Renvoie access + refresh (en dev). En production, stocker refresh token en HttpOnly cookie.
-  return res.json({
-    message: "Connecté avec succès",
-    accessToken,
-    refreshToken: refreshTokenPlain
-  });
+  res.json({ message: "Connecté", accessToken, refreshToken: refreshPlain });
 });
 
-// Refresh token
+// Refresh
 app.post("/refresh", async (req, res) => {
   const { email, refreshToken } = req.body || {};
   if (!email || !refreshToken) return res.status(400).json({ error: "email + refreshToken requis" });
@@ -126,51 +123,50 @@ app.post("/refresh", async (req, res) => {
   const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (!user) return res.status(400).json({ error: "Utilisateur introuvable" });
 
-  const tokens = db.prepare("SELECT id, token_hash, expires_at, revoked FROM refresh_tokens WHERE user_id = ?").all(user.id);
-  if (!tokens || tokens.length === 0) return res.status(401).json({ error: "Refresh token invalide" });
-
-  // Cherche un token qui matche
-  let found = null;
-  for (const row of tokens) {
-    const match = await bcrypt.compare(refreshToken, row.token_hash);
-    if (match) { found = row; break; }
+  const tokens = db.prepare("SELECT * FROM refresh_tokens WHERE user_id = ?").all(user.id);
+  let match = null;
+  for (const t of tokens) {
+    if (await bcrypt.compare(refreshToken, t.token_hash)) {
+      match = t;
+      break;
+    }
   }
-  if (!found) return res.status(401).json({ error: "Refresh token invalide" });
-  if (found.revoked) return res.status(401).json({ error: "Refresh token révoqué" });
-  if (found.expires_at < nowTs()) return res.status(401).json({ error: "Refresh token expiré" });
+  if (!match) return res.status(401).json({ error: "Refresh token invalide" });
+  if (match.revoked) return res.status(401).json({ error: "Token révoqué" });
+  if (match.expires_at < nowTs()) return res.status(401).json({ error: "Token expiré" });
 
-  // OK -> générer nouvel access token (et optionnellement nouveau refresh token)
-  const userRow = db.prepare("SELECT id, username, email, created_at FROM users WHERE id = ?").get(user.id);
-  const newAccess = generateAccessToken(userRow);
-
-  return res.json({ accessToken: newAccess });
+  const accessToken = generateAccessToken(user);
+  res.json({ accessToken });
 });
 
-// Protected route example
+// Profil protégé
 app.get("/me", authMiddleware, (req, res) => {
   const user = db.prepare("SELECT id, username, email, created_at FROM users WHERE id = ?").get(req.user.id);
   if (!user) return res.status(404).json({ error: "Utilisateur introuvable" });
-  return res.json({ user });
+  res.json({ user });
 });
 
-// Logout (révoquer refresh token côté serveur) - optionnel
+// Logout (révoque refresh token)
 app.post("/logout", async (req, res) => {
   const { email, refreshToken } = req.body || {};
   if (!email || !refreshToken) return res.status(400).json({ error: "email + refreshToken requis" });
+
   const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (!user) return res.status(400).json({ error: "Utilisateur introuvable" });
 
   const tokens = db.prepare("SELECT id, token_hash FROM refresh_tokens WHERE user_id = ?").all(user.id);
-  for (const row of tokens) {
-    const match = await bcrypt.compare(refreshToken, row.token_hash);
-    if (match) {
-      db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?").run(row.id);
-      return res.json({ message: "Déconnecté et token révoqué" });
+  for (const t of tokens) {
+    if (await bcrypt.compare(refreshToken, t.token_hash)) {
+      db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?").run(t.id);
+      return res.json({ message: "Déconnecté" });
     }
   }
-  return res.status(400).json({ error: "Refresh token non reconnu" });
+  res.status(400).json({ error: "Refresh token non reconnu" });
 });
 
+// ========================
+// START
+// ========================
 app.listen(PORT, () => {
-  console.log(`✅ Auth server running on http://localhost:${PORT}`);
+  console.log(`✅ Serveur d'auth lancé sur http://localhost:${PORT}`);
 });
